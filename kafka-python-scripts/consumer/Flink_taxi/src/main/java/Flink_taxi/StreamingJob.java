@@ -30,7 +30,14 @@ import java.lang.Math;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
 
+
+
 public class StreamingJob {
+	public static final double FORBIDDEN_CITY_LAT = 39.9163;
+	public static final double FORBIDDEN_CITY_LON = 116.3972;
+	public static final double INNER_RADIUS_KM = 10.0;
+	public static final double OUTER_RADIUS_KM = 15.0;
+	public static final double SPEED_LIMIT_KMH = 50.0;
 
 	public static void main(String[] args) throws Exception {
 		// set up the streaming execution environment
@@ -57,16 +64,42 @@ public class StreamingJob {
 				.keyBy(Taxilocations::getTaxi_id)
 				.process(new CalculateSpeed());
 
-		taxiSpeeds.print("TaxiSpeed Data");
+		// Notify Speeding
+		DataStream<String> speedingNotifications = taxiSpeeds
+				.keyBy(TaxiSpeed::getTaxi_id)
+				.process(new NotifySpeeding());
 
-		// Print Speed
-		taxiSpeeds.addSink(new SinkFunction<TaxiSpeed>() {
+		speedingNotifications.addSink(new SinkFunction<String>() {
 			@Override
-			public void invoke(TaxiSpeed value, Context context) {
-				System.out.printf("Taxi ID %s - Speed: %.2f\n", value.getTaxi_id(), value.getSpeed());
+			public void invoke(String value, Context context) {
+				System.out.println(value);
 			}
 		});
 
+		speedingNotifications.addSink(new RedisSink<>());
+
+		// Notify Leaving Area
+		DataStream<String> leavingAreaNotifications = taxilocationsDataStream
+				.keyBy(Taxilocations::getTaxi_id)
+				.process(new NotifyLeavingArea());
+
+		leavingAreaNotifications.addSink(new SinkFunction<String>() {
+			@Override
+			public void invoke(String value, Context context) {
+				System.out.println(value);
+			}
+		});
+		leavingAreaNotifications.addSink(new RedisSink<>());
+
+//		taxiSpeeds.print("TaxiSpeed Data");
+
+		// Print Speed
+		taxiSpeeds.addSink(new SinkFunction<>() {
+			@Override
+			public void invoke(TaxiSpeed value, Context context) {
+				System.out.printf("Taxi ID %s - Speed: %.2f km/h\n", value.getTaxi_id(), value.getSpeed());
+			}
+		});
 		// Calculate Average Speed Operator
 		DataStream<TaxiAverageSpeed> averageSpeeds = taxiSpeeds
 				.keyBy(TaxiSpeed::getTaxi_id)
@@ -74,11 +107,11 @@ public class StreamingJob {
 
 		// Print Average Speed
 		averageSpeeds.addSink(new SinkFunction<>() {
-            @Override
-            public void invoke(TaxiAverageSpeed value, Context context) {
-                System.out.printf("Taxi ID %s - Avg Speed: %.2f\n", value.getTaxi_id(), value.getAverageSpeed());
-            }
-        });
+			@Override
+			public void invoke(TaxiAverageSpeed value, Context context) {
+				System.out.printf("Taxi ID %s - Avg Speed: %.2f km/h\n", value.getTaxi_id(), value.getAverageSpeed());
+			}
+		});
 
 		averageSpeeds.print("TaxiAverageSpeed Data");
 
@@ -88,10 +121,10 @@ public class StreamingJob {
 				.process(new CalculateDistance());
 
 		// Print Distance
-		distances.addSink(new SinkFunction<TaxiDistance>() {
+		distances.addSink(new SinkFunction<>() {
 			@Override
 			public void invoke(TaxiDistance value, Context context) {
-				System.out.printf("Taxi ID %s - Distance: %.2f\n", value.getTaxi_id(), value.getDistance());
+				System.out.printf("Taxi ID %s - Distance: %.2f km\n", value.getTaxi_id(), value.getDistance());
 			}
 		});
 		distances.print("TaxiDistance Data");
@@ -102,11 +135,33 @@ public class StreamingJob {
 //		averageSpeeds.print();
 //		distances.print();
 		// Add Redis Sinks
+		taxilocationsDataStream.addSink(new RedisSink<>());
 		taxiSpeeds.addSink(new RedisSink<>());
 		averageSpeeds.addSink(new RedisSink<>());
 		distances.addSink(new RedisSink<>());
 		// execute program
 		env.execute("Flink Streaming Java API Skeleton");
+	}
+
+	public static class NotifySpeeding extends KeyedProcessFunction<String, TaxiSpeed, String> {
+		@Override
+		public void processElement(TaxiSpeed speed, Context context, Collector<String> out) throws Exception {
+			if (speed.getSpeed() > SPEED_LIMIT_KMH) {
+				out.collect("Warning: Taxi ID " + speed.getTaxi_id() + " is speeding at " + speed.getSpeed() + " km/h.");
+			}
+		}
+	}
+
+	public static class NotifyLeavingArea extends KeyedProcessFunction<String, Taxilocations, String> {
+		@Override
+		public void processElement(Taxilocations location, Context context, Collector<String> out) throws Exception {
+			double distanceFromCenter = Haversine.distance(FORBIDDEN_CITY_LAT, FORBIDDEN_CITY_LON, location.getLatitude(), location.getLongitude());
+			if (distanceFromCenter > INNER_RADIUS_KM && distanceFromCenter <= OUTER_RADIUS_KM) {
+				out.collect("Warning: Taxi ID " + location.getTaxi_id() + " is leaving the predefined area. Current distance: " + distanceFromCenter + " km.");
+			} else if (distanceFromCenter > OUTER_RADIUS_KM) {
+				// Discard information by not forwarding it
+			}
+		}
 	}
 	public static class CalculateSpeed extends KeyedProcessFunction<String, Taxilocations, TaxiSpeed> {
 		private transient ValueState<Taxilocations> lastLocationState;
@@ -131,8 +186,8 @@ public class StreamingJob {
 						lastLocation.getLatitude(), lastLocation.getLongitude(),
 						currentLocation.getLatitude(), currentLocation.getLongitude()
 				);
-				double timeDiff = (currentTimestamp - lastTimestamp) / 1000.0; // in seconds
-				double speed = distance / timeDiff; // in meters/second
+				double timeDiff = (currentTimestamp - lastTimestamp) / 3600000.0; // in hours
+				double speed = distance / timeDiff; // in kilometers per hour
 
 				out.collect(new TaxiSpeed(currentLocation.getTaxi_id(), speed));
 			}
@@ -166,7 +221,10 @@ public class StreamingJob {
 			currentState.f0 += 1;
 			currentState.f1 += speed.getSpeed();
 
-			double averageSpeed = currentState.f1 / currentState.f0;
+			double averageSpeed = 0.0;
+			if (currentState.f0 != 0) {
+				averageSpeed = currentState.f1 / currentState.f0;
+			}
 
 			out.collect(new TaxiAverageSpeed(speed.getTaxi_id(), averageSpeed));
 
