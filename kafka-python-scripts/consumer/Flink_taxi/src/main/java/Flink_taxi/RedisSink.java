@@ -7,6 +7,7 @@ import Dto.Taxilocations;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.streaming.api.functions.sink.RichSinkFunction;
 import redis.clients.jedis.Jedis;
+import org.json.JSONObject;
 
 public class RedisSink<T> extends RichSinkFunction<T> {
     private transient Jedis jedis;
@@ -36,10 +37,17 @@ public class RedisSink<T> extends RichSinkFunction<T> {
             jedis.hset("taxi:distance", distance.getTaxi_id(), String.valueOf(distance.getDistance()));
         } else if (value instanceof Taxilocations) {
             Taxilocations location = (Taxilocations) value;
-            String locationKey = "taxi:location:" + location.getTaxi_id();
-            jedis.hset(locationKey, "latitude", String.valueOf(location.getLatitude()));
-            jedis.hset(locationKey, "longitude", String.valueOf(location.getLongitude()));
-            jedis.hset(locationKey, "timestamp", location.getTimestamp());
+            // Create a JSON object for the location data
+            JSONObject json = new JSONObject();
+            json.put("latitude", location.getLatitude());
+            json.put("longitude", location.getLongitude());
+            json.put("timestamp", location.getTimestamp());
+
+            // Convert the JSON object to a string
+            String locationJson = json.toString();
+
+            // Store the JSON string in Redis
+            jedis.hset("taxi:location", location.getTaxi_id(), locationJson);
         } else if (value instanceof String) {
             String notification = (String) value;
             jedis.lpush("taxi:notifications", notification);
