@@ -19,11 +19,13 @@ import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.streaming.api.TimeCharacteristic;
 import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
+import org.apache.flink.streaming.api.functions.ProcessFunction;
 import org.apache.flink.streaming.api.functions.sink.SinkFunction;
 import org.apache.flink.util.Collector;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
 
@@ -55,6 +57,8 @@ public class StreamingJob {
 
         DataStream<TaxiSpeed> taxiSpeeds = taxilocationsDataStream
                 .keyBy(Taxilocations::getTaxi_id)
+                .process(new ValidateLocation())
+                .keyBy(Taxilocations::getTaxi_id)
                 .process(new CalculateSpeed());
 
         DataStream<String> speedingNotifications = taxiSpeeds
@@ -62,7 +66,6 @@ public class StreamingJob {
                 .process(new NotifySpeeding());
 
         speedingNotifications.addSink(createLoggingSink("Speeding Notification"));
-		
 
         DataStream<String> leavingAreaNotifications = taxilocationsDataStream
                 .keyBy(Taxilocations::getTaxi_id)
@@ -70,36 +73,41 @@ public class StreamingJob {
 
         leavingAreaNotifications.addSink(createLoggingSink("Leaving Area Notification"));
 
-		taxiSpeeds.addSink(new SinkFunction<>() {
-			@Override
-			public void invoke(TaxiSpeed value, Context context) {
-				System.out.printf("Taxi ID %s - Speed: %.2f km/h\n", value.getTaxi_id(), value.getSpeed());
-			}
-		});
+        taxiSpeeds.addSink(new SinkFunction<>() {
+            @Override
+            public void invoke(TaxiSpeed value, Context context) {
+                System.out.printf("Taxi ID %s - Speed: %.2f km/h\n", value.getTaxi_id(), value.getSpeed());
+            }
+        });
+
         DataStream<TaxiAverageSpeed> averageSpeeds = taxiSpeeds
                 .keyBy(TaxiSpeed::getTaxi_id)
                 .process(new CalculateAverageSpeed());
 
-				averageSpeeds.addSink(new SinkFunction<>() {
-					@Override
-					public void invoke(TaxiAverageSpeed value, Context context) {
-						System.out.printf("Taxi ID %s - Avg Speed: %.2f km/h\n", value.getTaxi_id(), value.getAverageSpeed());
-					}
-				});
-		
-				averageSpeeds.print("TaxiAverageSpeed Data");
+        averageSpeeds.addSink(new SinkFunction<>() {
+            @Override
+            public void invoke(TaxiAverageSpeed value, Context context) {
+                System.out.printf("Taxi ID %s - Avg Speed: %.2f km/h\n", value.getTaxi_id(), value.getAverageSpeed());
+            }
+        });
+
+        averageSpeeds.print("TaxiAverageSpeed Data");
+
         DataStream<TaxiDistance> distances = taxilocationsDataStream
                 .keyBy(Taxilocations::getTaxi_id)
                 .process(new CalculateDistance());
 
-				distances.addSink(new SinkFunction<>() {
-					@Override
-					public void invoke(TaxiDistance value, Context context) {
-						System.out.printf("Taxi ID %s - Distance: %.2f km\n", value.getTaxi_id(), value.getDistance());
-					}
-				});
-				distances.print("TaxiDistance Data");
-				taxilocationsDataStream.print();
+        distances.addSink(new SinkFunction<>() {
+            @Override
+            public void invoke(TaxiDistance value, Context context) {
+                System.out.printf("Taxi ID %s - Distance: %.2f km\n", value.getTaxi_id(), value.getDistance());
+            }
+        });
+
+        distances.print("TaxiDistance Data");
+
+        taxilocationsDataStream.print();
+
         // Add Redis sinks or other external sinks as needed
         taxilocationsDataStream.addSink(new RedisSink<>());
         taxiSpeeds.addSink(new RedisSink<>());
@@ -110,13 +118,13 @@ public class StreamingJob {
     }
 
     private static SinkFunction<String> createLoggingSink(String label) {
-		return new SinkFunction<String>() {
-			@Override
-			public void invoke(String value, Context context) {
-				LOG.info("{}: {}", label, value);
-			}
-		};
-	}
+        return new SinkFunction<String>() {
+            @Override
+            public void invoke(String value, Context context) {
+                LOG.info("{}: {}", label, value);
+            }
+        };
+    }
 
     public static class NotifySpeeding extends KeyedProcessFunction<String, TaxiSpeed, String> {
         @Override
@@ -180,8 +188,13 @@ public class StreamingJob {
             lastLocationState.update(currentLocation);
         }
 
-        private long parseTimestamp(String timestamp) throws ParseException {
-            return timestampFormat.parse(timestamp).getTime();
+        private long parseTimestamp(String timestamp) {
+            try {
+                return timestampFormat.parse(timestamp).getTime();
+            } catch (ParseException e) {
+                LOG.error("Error parsing timestamp: {}", timestamp, e);
+                return -1;
+            }
         }
     }
 
@@ -189,29 +202,31 @@ public class StreamingJob {
         private transient ValueState<Tuple2<Integer, Double>> speedState;
 
         @Override
-        public void open(Configuration parameters) {
+        public void open(Configuration parameters) throws IOException {
             ValueStateDescriptor<Tuple2<Integer, Double>> descriptor =
                     new ValueStateDescriptor<>("speedState", TupleTypeInfo.getBasicTupleTypeInfo(Integer.class, Double.class));
             speedState = getRuntimeContext().getState(descriptor);
+
+            if (speedState.value() == null) {
+                speedState.update(Tuple2.of(0, 0.0));
+            }
         }
 
         @Override
         public void processElement(TaxiSpeed speed, Context context, Collector<TaxiAverageSpeed> out) throws Exception {
             Tuple2<Integer, Double> currentState = speedState.value();
-
-            if (currentState == null) {
-                currentState = Tuple2.of(0, 0.0);
-            }
+            LOG.debug("Current state for taxi {}: count={}, totalSpeed={}", speed.getTaxi_id(), currentState.f0, currentState.f1);
 
             currentState.f0 += 1;
             currentState.f1 += speed.getSpeed();
 
             double averageSpeed = currentState.f0 != 0 ? currentState.f1 / currentState.f0 : 0.0;
 
-            if (!Double.isNaN(averageSpeed)) {
+            if (averageSpeed > 0 && !Double.isNaN(averageSpeed) && !Double.isInfinite(averageSpeed)) {
+                LOG.debug("Calculated average speed for taxi {}: {}", speed.getTaxi_id(), averageSpeed);
                 out.collect(new TaxiAverageSpeed(speed.getTaxi_id(), averageSpeed));
             } else {
-                LOG.warn("Calculated average speed is NaN for taxi ID {}", speed.getTaxi_id());
+                LOG.warn("Calculated average speed is invalid for taxi ID {}: {}", speed.getTaxi_id(), averageSpeed);
             }
 
             speedState.update(currentState);
@@ -255,6 +270,23 @@ public class StreamingJob {
 
             distanceState.update(totalDistance);
             lastLocationState.update(currentLocation);
+        }
+    }
+
+    public static class ValidateLocation extends ProcessFunction<Taxilocations, Taxilocations> {
+        @Override
+        public void processElement(Taxilocations location, Context context, Collector<Taxilocations> out) {
+            if (isValidLocation(location)) {
+                out.collect(location);
+            } else {
+                LOG.warn("Invalid location data for Taxi ID {}: {}", location.getTaxi_id(), location);
+            }
+        }
+
+        private boolean isValidLocation(Taxilocations location) {
+            // Add logic to validate location, e.g., within expected bounds
+            return location.getLatitude() >= -90 && location.getLatitude() <= 90 &&
+                   location.getLongitude() >= -180 && location.getLongitude() <= 180;
         }
     }
 }
