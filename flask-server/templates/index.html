@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Taxi Dashboard</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
+    <style>
+        * {
+            font-family: 'Source Sans Pro', sans-serif;
+        }
+
+        #map {
+            height: 450px;
+            width: 80%;
+            margin: auto;
+            box-shadow: 0 0 20px rgba(0, 0, 0, 0.6);
+        }
+
+        table {
+            margin: 2rem auto;
+            width: 90%;
+            border-collapse: collapse;
+            overflow: hidden;
+            box-shadow: 0 0 20px rgba(0, 0, 0, 0.6);
+        }
+
+        th {
+            padding: 15px;
+            background-color: rgba(255, 255, 255, 0.2);
+            color: #fff;
+            text-align: left;
+            background: #000;
+        }
+
+        td {
+            padding: 8px;
+            vertical-align: top;
+            text-align: left;
+            color: #000;
+            font-weight: bold;
+        }
+
+        td span {
+            display: inline-block;
+            margin-right: 10px;
+        }
+
+        th {
+            text-align: left;
+        }
+
+        tbody {
+            tr {
+                &:hover {
+                    background-color: rgba(255, 255, 255, 0.3);
+                }
+            }
+
+            td {
+                position: relative;
+                color: #000;
+                font-weight: bold;
+                text-align: left;
+                padding-left: 2rem;
+
+                &:hover {
+                    &:before {
+                        content: "";
+                        position: absolute;
+                        left: 0;
+                        right: 0;
+                        top: -9999px;
+                        bottom: -9999px;
+                        background-color: rgba(255, 255, 255, 0.2);
+                        z-index: -1;
+                    }
+                }
+            }
+        }
+
+        .alert-container {
+            width: 90%;
+            margin: 20px auto;
+            padding: 20px;
+        }
+
+        .alert {
+            padding: 15px;
+            margin-bottom: 10px;
+            border: 1px solid transparent;
+            border-radius: 4px;
+        }
+
+        .alert-primary {
+            color: #004085;
+            background-color: #cce5ff;
+            border-color: #b8daff;
+        }
+
+        .alert-warning {
+            color: #856404;
+            background-color: #fff3cd;
+            border-color: #ffeeba;
+        }
+
+        .alert-secondary {
+            color: #383d41;
+            background-color: #e2e3e5;
+            border-color: #d6d8db;
+        }
+    </style>
+</head>
+
+<body>
+    <h1 style="text-align: center;">Taxi Fleet Monitoring</h1>
+    <div class="alert-container" id="alert-container">
+        <!-- Alerts will be injected here -->
+    </div>
+    <div id="map"></div>
+    <table>
+        <thead>
+            <tr>
+                <th>Number of Taxis</th>
+                <th>Overall Distance Covered (km)</th>
+                <th>Area Violations (Taxi IDs)</th>
+                <th>Speeding Incidents (Taxi IDs)</th>
+            </tr>
+        </thead>
+        <tbody id="dashboard-data">
+            <tr>
+                <td id="currently-driving"></td>
+                <td id="total-distance"></td>
+                <td id="area-violations"></td>
+                <td id="speeding-incidents"></td>
+            </tr>
+        </tbody>
+    </table>
+
+    <script>
+        var map = L.map('map').setView([39.9163, 116.3972], 10);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+        }).addTo(map);
+
+        // Define the custom taxi icon
+        var taxiIcon = L.icon({
+            iconUrl: '/static/car.png', // Update this path to the location of your taxi icon image
+            iconSize: [32, 32], // Size of the icon
+            iconAnchor: [16, 32], // Point of the icon which will correspond to marker's location
+            popupAnchor: [0, -32] // Point from which the popup should open relative to the iconAnchor
+        });
+
+        var taxiMarkers = {}; // Dictionary to keep track of taxi markers by ID
+
+        async function updateTaxiLocations() {
+            try {
+                const response = await fetch('/taxi-locations');
+                const data = await response.json();
+                console.log('Taxi locations data:', data); // Log the data for debugging
+
+                // Remove old markers that are not in the updated data
+                for (let taxi_id in taxiMarkers) {
+                    if (!data.some(location => location.taxi_id === taxi_id)) {
+                        map.removeLayer(taxiMarkers[taxi_id]);
+                        delete taxiMarkers[taxi_id];
+                    }
+                }
+
+                // Add or update markers
+                data.forEach(location => {
+                    if (taxiMarkers[location.taxi_id]) {
+                        map.removeLayer(taxiMarkers[location.taxi_id]);
+                    }
+                    const marker = L.marker([location.latitude, location.longitude], { icon: taxiIcon })
+                        .addTo(map)
+                        .bindPopup(`Taxi ID: ${location.taxi_id}<br>Timestamp: ${location.timestamp}`);
+                    taxiMarkers[location.taxi_id] = marker;
+                });
+            } catch (error) {
+                console.error('Error fetching taxi locations:', error);
+            }
+        }
+
+        async function updateDashboard() {
+            try {
+                const response = await fetch('/dashboard-data');
+                const data = await response.json();
+                console.log('Dashboard data:', data); // Log the data for debugging
+                document.getElementById('currently-driving').textContent = data.currently_driving;
+                document.getElementById('total-distance').textContent = data.total_distance.toFixed(2);
+                document.getElementById('area-violations').innerHTML = formatTaxiIds(data.area_violations);
+                document.getElementById('speeding-incidents').innerHTML = formatTaxiIds(data.speeding_incidents);
+                updateAlerts(data.leaving_area_warnings); // Update alerts
+
+            } catch (error) {
+                console.error('Error fetching dashboard data:', error);
+            }
+        }
+
+        function formatTaxiIds(taxiIds) {
+            let formattedIds = '';
+            for (let i = 0; i < taxiIds.length; i++) {
+                formattedIds += `<span>${taxiIds[i]}</span>`;
+                if ((i + 1) % 5 === 0) {
+                    formattedIds += '<br>';
+                }
+            }
+            return formattedIds;
+        }
+
+        function updateAlerts(leavingAreaWarnings) {
+            const alertContainer = document.getElementById('alert-container');
+
+            if (leavingAreaWarnings.length > 0) {
+                let currentWarningIndex = 0;
+
+                function showNextWarning() {
+                    if (currentWarningIndex >= leavingAreaWarnings.length) {
+                        return;
+                    }
+
+                    const taxiId = leavingAreaWarnings[currentWarningIndex];
+                    const alertDiv = document.createElement('div');
+                    alertDiv.className = 'alert alert-warning';
+                    alertDiv.role = 'alert';
+                    alertDiv.textContent = `Warning: Taxi ID ${taxiId} is leaving the predefined area.`;
+
+                    // Clear the existing content and append the new alert
+                    alertContainer.innerHTML = '';
+                    alertContainer.appendChild(alertDiv);
+
+                    currentWarningIndex++;
+                    setTimeout(showNextWarning, 3000); // Display each warning for 3 seconds
+                }
+
+                showNextWarning();
+            } else {
+                const alertDiv = document.createElement('div');
+                alertDiv.className = 'alert alert-primary';
+                alertDiv.role = 'alert';
+                alertDiv.textContent = 'No taxis are leaving the predefined area.';
+
+                // Clear the existing content and append the new alert
+                alertContainer.innerHTML = '';
+                alertContainer.appendChild(alertDiv);
+            }
+        }
+
+        updateTaxiLocations();
+        updateDashboard();
+        setInterval(updateTaxiLocations, 1000); // Update every second
+        setInterval(updateDashboard, 1000); // Update every second
+    </script>
+</body>
+
+</html>

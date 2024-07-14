@@ -8,6 +8,8 @@ services:
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - my_network
     
   kafka:
     image: confluentinc/cp-kafka:6.1.1
@@ -27,11 +29,11 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    networks:
+      - my_network
 
   python-producer:
-    build:
-      context: ./kafka-python-scripts/producer
-      dockerfile: Dockerfile
+    image: hetparekh/python-producer:latest
     volumes:
       - ./kafka-python-scripts:/app
     depends_on:
@@ -39,21 +41,16 @@ services:
       - kafka
     environment:
       KAFKA_BROKER: kafka:29092
+    networks:
+      - my_network
 
   redis:
     image: redis:latest
     container_name: redis
     ports:
       - "6379:6379"
-
-  grafana:
-    image: grafana/grafana:latest
-    container_name: grafana
-    ports:
-      - "3000:3000"
-    depends_on:
-      - redis
-
+    networks:
+      - my_network
 
   flink-jobmanager:
     image: flink:1.18.1-scala_2.12-java17
@@ -64,8 +61,14 @@ services:
       - |
         FLINK_PROPERTIES=
         jobmanager.rpc.address: flink-jobmanager        
-
     command: jobmanager
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/overview"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - my_network
 
   flink-taskmanager:
     image: flink:1.18.1-scala_2.12-java17
@@ -77,3 +80,31 @@ services:
         FLINK_PROPERTIES=
         jobmanager.rpc.address: flink-jobmanager
         taskmanager.numberOfTaskSlots: 5  
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://flink-jobmanager:8081/overview"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - my_network
+
+  job-submitter:
+    image: hetparekh/job-submitter:latest
+    depends_on:
+      - flink-jobmanager
+      - kafka
+    networks:
+      - my_network
+
+  flask-server:
+    image: hetparekh/flask-server:latest
+    ports:
+      - "5000:5000"
+    depends_on:
+      - redis
+    networks:
+      - my_network
+
+networks:
+  my_network:
+    driver: bridge
